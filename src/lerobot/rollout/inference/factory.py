@@ -33,6 +33,7 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.processor import PolicyProcessorPipeline
 
 from ..robot_wrapper import ThreadSafeRobot
+from .backend import InferenceBackend, LocalInferenceBackend
 from .base import InferenceEngine
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
@@ -73,6 +74,15 @@ class RTCInferenceConfig(InferenceEngineConfig):
     rtc: RTCConfig = field(default_factory=RTCConfig)
     queue_threshold: int = 30
 
+    # ``host:port`` of a ``lerobot.async_inference.policy_server``.  Unset runs the
+    # policy in this process.  Setting it moves only the model: the queue, the delay
+    # estimate and the merge stay here, next to the robot, which is what lets RTC
+    # measure a round trip and condition the next chunk on it.
+    server_address: str | None = None
+    # Deadline for one remote chunk call.  Should exceed the server's inference time by
+    # a healthy margin; a call that times out costs the robot a queue refill.
+    server_timeout_s: float = 10.0
+
 
 # ---------------------------------------------------------------------------
 # Factory
@@ -82,7 +92,7 @@ class RTCInferenceConfig(InferenceEngineConfig):
 def create_inference_engine(
     config: InferenceEngineConfig,
     *,
-    policy: PreTrainedPolicy,
+    policy: PreTrainedPolicy | None,
     preprocessor: PolicyProcessorPipeline,
     postprocessor: PolicyProcessorPipeline,
     robot_wrapper: ThreadSafeRobot,
@@ -95,31 +105,40 @@ def create_inference_engine(
     use_torch_compile: bool = False,
     compile_warmup_inferences: int = 2,
     shutdown_event: Event | None = None,
+    backend: InferenceBackend | None = None,
 ) -> InferenceEngine:
-    """Instantiate the appropriate inference engine from a config object."""
+    """Instantiate the appropriate inference engine from a config object.
+
+    ``backend`` chooses *where* the model runs and defaults to this process; the engine
+    choice is independent of it.  ``policy`` may be ``None`` only when a ``backend`` is
+    supplied, i.e. when the weights live elsewhere.
+    """
     logger.info("Creating inference engine: %s", config.type)
-    if isinstance(config, SyncInferenceConfig):
-        return SyncInferenceEngine(
+    if backend is None:
+        if policy is None:
+            raise ValueError("create_inference_engine needs either a policy or a backend")
+        backend = LocalInferenceBackend(
             policy=policy,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
+            device=device,
+            robot_type=robot_wrapper.robot_type,
+            fallback_action_names=[k for k in robot_wrapper.action_features if k.endswith(".pos")],
+        )
+    if isinstance(config, SyncInferenceConfig):
+        return SyncInferenceEngine(
+            backend=backend,
             dataset_features=dataset_features,
             ordered_action_keys=ordered_action_keys,
             task=task,
-            device=device,
-            robot_type=robot_wrapper.robot_type,
         )
     if isinstance(config, RTCInferenceConfig):
         return RTCInferenceEngine(
-            policy=policy,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            robot_wrapper=robot_wrapper,
+            backend=backend,
             rtc_config=config.rtc,
             hw_features=hw_features,
             task=task,
             fps=fps,
-            device=device,
             use_torch_compile=use_torch_compile,
             compile_warmup_inferences=compile_warmup_inferences,
             rtc_queue_threshold=config.queue_threshold,

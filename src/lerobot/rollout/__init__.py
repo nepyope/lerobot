@@ -53,8 +53,10 @@ from .controller import (
     RolloutEvent,
 )
 from .inference import (
+    InferenceBackend,
     InferenceEngine,
     InferenceEngineConfig,
+    LocalInferenceBackend,
     QueryAnswer,
     QueryKind,
     RTCInferenceConfig,
@@ -88,10 +90,12 @@ __all__ = [
     "HardwareContext",
     "HighlightStrategy",
     "HighlightStrategyConfig",
+    "InferenceBackend",
     "InferenceEngine",
     "InferenceEngineConfig",
     "InteractiveSession",
     "LinkedEvent",
+    "LocalInferenceBackend",
     "PolicyContext",
     "ProcessorContext",
     "QueryAnswer",

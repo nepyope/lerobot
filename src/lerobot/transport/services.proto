@@ -42,6 +42,22 @@ service AsyncInference {
   rpc GetActions(Empty) returns (Actions);
   rpc SendPolicyInstructions(PolicySetup) returns (Empty);
   rpc Ready(Empty) returns (Empty);
+
+  // Robot -> Policy: one chunk, conditioned on the caller's Real-Time Chunking state.
+  //
+  // Unlike SendObservations/GetActions, which are two independent streams, this is a
+  // single request/response: the caller measures the round trip and uses it as the
+  // inference delay for the next chunk.  The server always answers, so a call that
+  // returns is always one inference (see lerobot.rollout.inference.remote).
+  //
+  // The request is streamed only because an observation frame carrying camera images
+  // exceeds the 4MB message cap; it is still one logical call.
+  rpc PredictChunk(stream ChunkRequest) returns (ChunkResponse);
+
+  // Robot -> Policy: everything about the remote backend that is not an inference
+  // (capability query, episode reset).  Kept off PredictChunk so that path stays one
+  // call = one inference, which is what makes the measured round trip a valid delay.
+  rpc BackendControl(BackendCommand) returns (BackendReply);
 }
 
 enum TransferState {
@@ -81,6 +97,27 @@ message Actions {
 
 message PolicySetup {
   // sent by Robot to remote server, to init Policy
+  bytes data = 1;
+}
+
+message ChunkRequest {
+  // sent by Robot, to remote Policy: observation frame + RTC conditioning state
+  TransferState transfer_state = 1;  // camera frames push a request past 4MB
+  bytes data = 2;
+}
+
+message ChunkResponse {
+  // sent by remote Policy, to Robot: the chunk in both policy and robot space
+  bytes data = 1;
+}
+
+message BackendCommand {
+  // sent by Robot, to remote Policy: a pickled non-inference request
+  bytes data = 1;
+}
+
+message BackendReply {
+  // sent by remote Policy, to Robot: the pickled result of a BackendCommand
   bytes data = 1;
 }
 

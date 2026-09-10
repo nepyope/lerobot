@@ -55,6 +55,19 @@ class PolicyQuery:
     text: str
 
 
+def mark_query(batch: dict, query: PolicyQuery) -> dict:
+    """Stamp ``batch`` with the query's kind and text, for the preprocessor.
+
+    Call between ``prepare_observation_for_inference`` and the preprocessor pipeline.
+    ``QUERY_KIND`` / ``QUERY_TEXT`` are allowlisted complementary data, so they land
+    beside ``task``: a policy-specific ``ComplementaryDataProcessorStep`` can read the
+    kind there and rewrite ``QUERY_TEXT`` into its prompt format.
+    """
+    batch[QUERY_KIND] = query.kind.value
+    batch[QUERY_TEXT] = query.text
+    return batch
+
+
 @dataclass(frozen=True)
 class QueryAnswer:
     """Result of a policy text query.
@@ -410,18 +423,12 @@ class InferenceEngine(abc.ABC):
             f"{type(self).__name__} does not support text queries — no /vqa or /autosteer on this backend."
         )
 
-    @staticmethod
-    def _mark_query(batch: dict, query: PolicyQuery) -> dict:
-        """Stamp ``batch`` with the query's kind and text, for the preprocessor.
+    _mark_query = staticmethod(mark_query)
+    """Stamp a batch with a query's kind and text. See :func:`mark_query`.
 
-        Call between ``prepare_observation_for_inference`` and the preprocessor pipeline.
-        ``QUERY_KIND`` / ``QUERY_TEXT`` are allowlisted complementary data, so they land
-        beside ``task``: a policy-specific ``ComplementaryDataProcessorStep`` can read the
-        kind there and rewrite ``QUERY_TEXT`` into its prompt format.
-        """
-        batch[QUERY_KIND] = query.kind.value
-        batch[QUERY_TEXT] = query.text
-        return batch
+    Kept on the class because backends stamp their own batches now, but subclasses and
+    callers reach for it here.
+    """
 
     def drop_ready_subtask_answers(self) -> None:
         """Discard undelivered ``NEXT_SUBTASK`` answers.

@@ -17,17 +17,14 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
-from copy import copy
 
 import torch
 
-from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
-from lerobot.processor import PolicyProcessorPipeline
+from lerobot.policies.utils import make_robot_action
 from lerobot.utils.constants import OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 
+from .backend import InferenceBackend
 from .base import InferenceEngine, PolicyQuery
 
 logger = logging.getLogger(__name__)
@@ -58,26 +55,18 @@ class SyncInferenceEngine(InferenceEngine):
 
     def __init__(
         self,
-        policy: PreTrainedPolicy,
-        preprocessor: PolicyProcessorPipeline,
-        postprocessor: PolicyProcessorPipeline,
+        backend: InferenceBackend,
         dataset_features: dict,
         ordered_action_keys: list[str],
         task: str,
-        device: str | None,
-        robot_type: str,
     ) -> None:
         super().__init__(task=task)
-        self._policy = policy
-        self._preprocessor = preprocessor
-        self._postprocessor = postprocessor
+        self._backend = backend
         self._dataset_features = dataset_features
         self._ordered_action_keys = ordered_action_keys
-        self._device = torch.device(device or "cpu")
-        self._robot_type = robot_type
         logger.info(
-            "SyncInferenceEngine initialized (device=%s, action_keys=%d)",
-            self._device,
+            "SyncInferenceEngine initialized (backend=%s, action_keys=%d)",
+            type(backend).__name__,
             len(ordered_action_keys),
         )
 
@@ -86,15 +75,14 @@ class SyncInferenceEngine(InferenceEngine):
         logger.info("SyncInferenceEngine started (inline mode — no background thread)")
 
     def stop(self) -> None:
-        """No background resources to stop."""
+        """Release the backend; no background resources of our own."""
+        self._backend.close()
         logger.info("SyncInferenceEngine stopped")
 
     def reset(self) -> None:
         """Reset the policy and pre/post-processors."""
         logger.info("Resetting sync inference state (policy + processors)")
-        self._policy.reset()
-        self._preprocessor.reset()
-        self._postprocessor.reset()
+        self._backend.reset()
         # The policy was just reset, so a pending task change has nothing stale to flush.
         self._discard_task_change()
 
@@ -102,28 +90,13 @@ class SyncInferenceEngine(InferenceEngine):
         """Run the full inference pipeline on ``obs_frame`` and return an action tensor."""
         if obs_frame is None:
             return None
-        # Shallow copy is intentional: the caller (`send_next_action`) builds
-        # ``obs_frame`` fresh per tick via ``build_dataset_frame``, so the
-        # tensor/array values are not shared with any other reader.
-        observation = copy(obs_frame)
-        autocast_ctx = (
-            torch.autocast(device_type=self._device.type)
-            if self._device.type == "cuda" and self._policy.config.use_amp
-            else nullcontext()
-        )
         task, task_changed = self._take_task()
-        with torch.inference_mode(), autocast_ctx:
-            if task_changed:
-                # Chunking policies queue actions computed under the previous instruction,
-                # so drop them and let the new one take effect on this tick.  Narrower
-                # than ``policy.reset``: observation history and other episode state stay.
-                logger.info("Task changed to '%s' — dropping precomputed actions", task)
-                self._policy.drop_queued_actions()
-            observation = prepare_observation_for_inference(observation, self._device, task, self._robot_type)
-            observation = self._preprocessor(observation)
-            action = self._policy.select_action(observation)
-            action = self._postprocessor(action)
-        action_tensor = action.squeeze(0).cpu()
+        if task_changed:
+            # Chunking policies queue actions computed under the previous instruction,
+            # so drop them and let the new one take effect on this tick.  Narrower
+            # than ``policy.reset``: observation history and other episode state stay.
+            logger.info("Task changed to '%s' — dropping precomputed actions", task)
+        action_tensor = self._backend.select_action(obs_frame, task, drop_queued=task_changed)
 
         # Reorder to match dataset action ordering so the caller can treat
         # the returned tensor uniformly across backends.
@@ -140,7 +113,7 @@ class SyncInferenceEngine(InferenceEngine):
     @property
     def supports_text_queries(self) -> bool:
         """True when the policy has a text head."""
-        return self._policy.supports_text_generation()
+        return self._backend.supports_text_generation
 
     @property
     def control_thread_owns_policy(self) -> bool:
@@ -150,19 +123,8 @@ class SyncInferenceEngine(InferenceEngine):
     def _generate_text(self, obs_processed: dict, query: PolicyQuery) -> str:
         """Run the policy's text head on the current observation."""
         obs_frame = build_dataset_frame(self._dataset_features, obs_processed, prefix=OBS_STR)
-        autocast_ctx = (
-            torch.autocast(device_type=self._device.type)
-            if self._device.type == "cuda" and self._policy.config.use_amp
-            else nullcontext()
-        )
         # Live task, read without consuming the task-changed edge (the action path needs it).
-        task = self.task
-        with torch.inference_mode(), autocast_ctx:
-            observation = prepare_observation_for_inference(obs_frame, self._device, task, self._robot_type)
-            observation = self._mark_query(observation, query)
-            # Reusing the action path's preprocessor is safe only while its steps are
-            # stateless per call; the one that is not (an enabled RelativeActionsProcessorStep)
-            # is rejected for this backend at context-build time.
-            observation = self._preprocessor(observation)
-            # No str() coercion: _service_query validates the return value.
-            return self._policy.generate_text(observation)
+        # Reusing the action path's preprocessor is safe only while its steps are stateless
+        # per call; the one that is not (an enabled RelativeActionsProcessorStep) is
+        # rejected for this engine at context-build time.
+        return self._backend.generate_text(obs_frame, self.task, query)

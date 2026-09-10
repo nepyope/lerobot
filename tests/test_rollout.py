@@ -566,6 +566,192 @@ def test_create_inference_engine_sync():
 
 
 # ---------------------------------------------------------------------------
+# Inference backend seam
+# ---------------------------------------------------------------------------
+
+
+def _recording_backend_cls():
+    """Deferred so the module-scoped ``datasets`` skip above still applies."""
+    from lerobot.rollout.inference import InferenceBackend
+
+    class _RecordingBackend(InferenceBackend):
+        """A backend with no policy, processors, or device behind it.
+
+        Standing in for a networked one: if the engines can be driven by this, they no
+        longer assume the model lives in their own process.  Subclasses the real ABC so
+        a missing member is a test failure rather than a duck-typing near-miss.
+        """
+
+        rtc_training_max_delay = 0
+        supports_text_generation = False
+
+        def __init__(self, chunk_len: int = 10, action_dim: int = 2):
+            self.chunk_len = chunk_len
+            self.action_dim = action_dim
+            self.requests: list = []
+            self.reset_count = 0
+
+        def reset(self) -> None:
+            self.reset_count += 1
+
+        def select_action(self, obs_frame, task, *, drop_queued):
+            self.requests.append((dict(obs_frame), task, drop_queued))
+            return torch.zeros(self.action_dim)
+
+        def predict_chunk(self, request):
+            from lerobot.rollout.inference import ChunkResult
+
+            self.requests.append(request)
+            chunk = torch.zeros(self.chunk_len, self.action_dim)
+            return ChunkResult(original=chunk, processed=chunk.clone())
+
+        def generate_text(self, obs_frame, task, query) -> str:
+            raise AssertionError("this backend has no text head")
+
+    return _RecordingBackend
+
+
+def test_sync_engine_runs_on_an_injected_backend():
+    """No policy, no processors, no device — the engine only needs the seam."""
+    import numpy as np
+
+    from lerobot.rollout.inference import SyncInferenceEngine
+
+    backend = _recording_backend_cls()()
+    engine = SyncInferenceEngine(
+        backend=backend,
+        dataset_features={
+            "action": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
+        },
+        ordered_action_keys=["j1.pos", "j2.pos"],
+        task="stack the blocks",
+    )
+
+    action = engine.get_action({"observation.state": np.zeros(2, dtype=np.float32)})
+
+    assert action is not None and action.shape == (2,)
+    _, task, drop_queued = backend.requests[0]
+    assert task == "stack the blocks"
+    assert drop_queued is False
+
+    engine.reset()
+    assert backend.reset_count == 1
+
+
+def test_rtc_engine_runs_on_an_injected_backend():
+    """The RTC loop's own work — delay estimate, queue, merge — needs no local policy."""
+    import time
+
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.rollout.inference import RTCInferenceEngine
+
+    backend = _recording_backend_cls()()
+    engine = RTCInferenceEngine(
+        backend=backend,
+        rtc_config=RTCConfig(enabled=True, execution_horizon=8, max_guidance_weight=1.0),
+        hw_features={
+            "observation.state": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
+        },
+        task="stack the blocks",
+        fps=30.0,
+    )
+    engine.start()
+    try:
+        engine.resume()
+        engine.notify_observation({"j1.pos": 0.0, "j2.pos": 0.0})
+
+        deadline = time.perf_counter() + 5.0
+        while time.perf_counter() < deadline and not backend.requests:
+            time.sleep(0.01)
+        assert backend.requests, "the RTC loop never reached the backend"
+
+        first = backend.requests[0]
+        assert first.task == "stack the blocks"
+        # Nothing has been queued yet, so the first chunk is unconditioned.
+        assert first.prev_chunk_left_over is None
+        assert first.prev_chunk_absolute is None
+        assert first.prefix_target_steps == 8
+        # A dataset frame, not a device-placed batch: that is what a wire could carry.
+        assert "observation.state" in first.obs_frame
+
+        deadline = time.perf_counter() + 5.0
+        while time.perf_counter() < deadline and engine.get_action(None) is None:
+            time.sleep(0.01)
+        assert engine.dispatched_task == "stack the blocks"
+    finally:
+        engine.stop()
+
+
+def test_local_backend_rebases_a_relative_prefix_before_the_policy_call():
+    """The rebase reads state the preprocessor caches during the same call, so it has
+    to happen behind the seam — and after it, the prefix is still length-normalized."""
+    import numpy as np
+
+    from lerobot.processor import RelativeActionsProcessorStep
+    from lerobot.rollout.inference import backend as backend_module
+    from lerobot.rollout.inference.backend import ChunkRequest, LocalInferenceBackend
+
+    relative_step = RelativeActionsProcessorStep(enabled=True, action_names=["j1.pos", "j2.pos"])
+    cached_state = torch.tensor([0.5, -0.5])
+    relative_step._last_state = cached_state
+
+    class _PipelineWithRelativeStep:
+        steps = (relative_step,)
+
+        def __call__(self, batch):
+            return batch
+
+        def reset(self):
+            pass
+
+    seen = {}
+
+    def _fake_reanchor(*, prev_actions_absolute, current_state, **_kwargs):
+        seen["prev_actions_absolute"] = prev_actions_absolute
+        seen["current_state"] = current_state
+        return torch.full((3, 2), 7.0)
+
+    policy = MagicMock()
+    policy.config.action_feature_names = ["j1.pos", "j2.pos"]
+    policy.predict_action_chunk.return_value = torch.zeros(1, 4, 2)
+
+    backend = LocalInferenceBackend(
+        policy=policy,
+        preprocessor=_PipelineWithRelativeStep(),
+        postprocessor=lambda actions: actions,
+        device="cpu",
+        robot_type="mock",
+    )
+    assert backend.relative_actions_enabled
+
+    monkeypatched = backend_module.reanchor_relative_rtc_prefix
+    backend_module.reanchor_relative_rtc_prefix = _fake_reanchor
+    try:
+        backend.predict_chunk(
+            ChunkRequest(
+                obs_frame={"observation.state": np.zeros(2, dtype=np.float32)},
+                task="stack the blocks",
+                inference_delay=3,
+                prev_chunk_left_over=torch.ones(5, 2),
+                prev_chunk_absolute=torch.ones(5, 2) * 2,
+                prefix_target_steps=8,
+            )
+        )
+    finally:
+        backend_module.reanchor_relative_rtc_prefix = monkeypatched
+
+    assert torch.equal(seen["prev_actions_absolute"], torch.ones(5, 2) * 2)
+    assert torch.equal(seen["current_state"], cached_state)
+
+    prefix = policy.predict_action_chunk.call_args.kwargs["prev_chunk_left_over"]
+    # The rebase returned 3 steps; the padding to 8 happens after it, not before.
+    assert prefix.shape == (8, 2)
+    assert torch.equal(prefix[:3], torch.full((3, 2), 7.0))
+    assert torch.equal(prefix[3:], torch.zeros(5, 2))
+    assert policy.predict_action_chunk.call_args.kwargs["inference_delay"] == 3
+
+
+# ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------
 

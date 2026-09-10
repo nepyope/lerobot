@@ -297,6 +297,51 @@ We found the default values of `actions_per_chunk` and `chunk_size_threshold` to
 
 ---
 
+## Remote inference for a rollout engine (Real-Time Chunking)
+
+The client above is one of two ways to put a policy on another machine. It streams observations
+up and action chunks down as two independent flows, and blends whatever arrives into its queue.
+That works for any policy, but it cannot support [Real-Time Chunking](./rtc), which needs to
+condition each chunk on the measured latency of the *previous* one — and there is no single call
+whose duration is that latency when the two directions are decoupled.
+
+For an RTC policy, point `lerobot-rollout` at the same policy server instead. Only the model moves:
+the action queue, the delay estimate and the chunk merge stay next to the robot.
+
+On the machine with the GPU:
+
+```bash
+python -m lerobot.async_inference.policy_server --host=0.0.0.0 --port=8080
+```
+
+On the robot, add a server address to the RTC engine you would otherwise run locally:
+
+```bash
+lerobot-rollout \
+  --robot.type=so101_follower \
+  --policy.path=<your/rtc-policy> \
+  --inference.type=rtc \
+  --inference.server_address=<gpu-host>:8080 \
+  --fps=30
+```
+
+The robot process never loads the weights. It hands the server the checkpoint path, revision,
+device, normalization statistics and RTC config on connect, so the server rebuilds exactly the
+policy and processors the robot would have built itself — the statistics matter, because if the
+two ends normalize differently the result is bad actions rather than an error.
+
+Each cycle is then one `PredictChunk` call, and the round trip *is* the inference delay the next
+chunk is conditioned on. Unlike the streaming path, the server never declines a request: the
+engine only asks when its queue is draining, so a refusal would override the one component that
+knows a chunk is needed.
+
+Set `--inference.server_timeout_s` above the server's inference time with margin; a call that
+times out costs the robot a queue refill. Per-tick (`--inference.type=sync`) and πR² inference
+stay local — the first would put a network round trip inside every control tick, and the second
+carries denoising state across calls rather than being a request/response.
+
+---
+
 ## Conclusion
 
 Asynchronous inference represents a significant advancement in real-time robotics control, addressing the fundamental challenge of inference latency that has long plagued robotics applications. Through this tutorial, you've learned how to implement a complete async inference pipeline that eliminates idle frames and enables smoother, more reactive robot behaviors.

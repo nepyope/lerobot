@@ -272,6 +272,20 @@ class RemotePolicyConfig:
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
 
+    # Appended, with defaults, so the streaming client's positional construction and any
+    # older client still work.  Only the rollout inference backend sets these.
+    robot_type: str = ""
+    """Passed to observation preparation, which happens on the server."""
+    pretrained_revision: str | None = None
+    """Kept alongside the path so the server resolves the same checkpoint revision."""
+    dataset_stats: dict[str, dict[str, Any]] | None = None
+    """Normalization statistics.  Sent because the caller may normalize against a
+    dataset's stats rather than the checkpoint's; without them the two sides of the
+    same policy would normalize differently, which shows up as bad actions, not an error."""
+    rtc_config: Any = None
+    """``RTCConfig`` for Real-Time Chunking.  The policy needs it attached after loading,
+    so it can only be applied where the weights live."""
+
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:
     """Check if two observation states are similar, under a tolerance threshold"""

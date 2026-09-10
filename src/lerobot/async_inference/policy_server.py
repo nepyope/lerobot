@@ -88,6 +88,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
 
+        # Built on first PredictChunk / BackendControl; see _rollout_backend.
+        self._backend = None
+        self._backend_robot_type = ""
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
@@ -101,6 +105,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # only running inference on the latest observation received by the server
         self.shutdown_event.set()
         self.observation_queue = Queue(maxsize=1)
+        # Dropped rather than reset: the next client re-declares its policy and robot.
+        self._backend = None
+        self._backend_robot_type = ""
 
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
@@ -145,11 +152,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
+        self._backend_robot_type = policy_specs.robot_type
 
         policy_class = get_policy_class(self.policy_type)
 
         start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        self.policy = policy_class.from_pretrained(
+            policy_specs.pretrained_name_or_path, revision=policy_specs.pretrained_revision
+        )
+        if policy_specs.rtc_config is not None:
+            # Real-Time Chunking needs its config attached to the loaded policy, so this
+            # can only happen here — the caller has no policy object to attach it to.
+            self.policy.config.rtc_config = policy_specs.rtc_config
+            if hasattr(self.policy, "init_rtc_processor"):
+                self.policy.init_rtc_processor()
         self.policy.to(self.device)
 
         # Load preprocessor and postprocessor, overriding device to match requested device
@@ -157,12 +173,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
             pretrained_path=policy_specs.pretrained_name_or_path,
+            pretrained_revision=policy_specs.pretrained_revision,
+            dataset_stats=policy_specs.dataset_stats,
             preprocessor_overrides={
                 "device_processor": device_override,
                 "rename_observations_processor": {"rename_map": policy_specs.rename_map},
             },
             postprocessor_overrides={"device_processor": device_override},
         )
+        # Any backend built for the previous policy now wraps stale objects.
+        self._backend = None
 
         end = time.perf_counter()
 
@@ -210,6 +230,86 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
 
         return services_pb2.Empty()
+
+    # ------------------------------------------------------------------
+    # Rollout inference backend (Real-Time Chunking over the wire)
+    # ------------------------------------------------------------------
+
+    def _rollout_backend(self):
+        """The rollout inference backend wrapping this server's policy.
+
+        Delegating to this rather than reimplementing the chunk path here is the point:
+        the relative-action prefix rebase, the prefix length normalization, and the
+        raw/postprocessed split are RTC details that must not exist in two places.
+        Imported lazily so the streaming path does not pull in ``lerobot.rollout`` and
+        its dataset extra.
+        """
+        if self.policy is None:
+            raise RuntimeError("No policy loaded — call SendPolicyInstructions first")
+        if self._backend is None:
+            from lerobot.rollout.inference.backend import LocalInferenceBackend
+
+            self._backend = LocalInferenceBackend(
+                policy=self.policy,
+                preprocessor=self.preprocessor,
+                postprocessor=self.postprocessor,
+                device=self.device,
+                robot_type=self._backend_robot_type,
+            )
+        return self._backend
+
+    def PredictChunk(self, request_iterator, context):  # noqa: N802
+        """Run exactly one chunk inference for a rollout engine and answer with it.
+
+        Always answers: see ``lerobot.rollout.inference.remote`` for why refusing
+        would break the caller's delay measurement.
+        """
+        from lerobot.rollout.inference.backend import ChunkRequest
+
+        received_bytes = receive_bytes_in_chunks(request_iterator, None, self.shutdown_event, self.logger)
+        request = pickle.loads(received_bytes)  # nosec
+        if not isinstance(request, ChunkRequest):
+            raise TypeError(f"PredictChunk expects a ChunkRequest, got {type(request).__name__}")
+
+        start = time.perf_counter()
+        result = self._rollout_backend().predict_chunk(request)
+        inference_time = time.perf_counter() - start
+
+        # The caller may have no accelerator, so nothing device-resident may cross back.
+        result = type(result)(original=result.original.cpu(), processed=result.processed.cpu())
+
+        self.logger.info(
+            f"Chunk inference: delay={request.inference_delay} | "
+            f"prefix={'none' if request.prev_chunk_left_over is None else 'yes'} | "
+            f"{inference_time * 1000:.1f}ms"
+        )
+        return services_pb2.ChunkResponse(data=pickle.dumps(result))
+
+    def BackendControl(self, request, context):  # noqa: N802
+        """Serve a non-inference backend request (capabilities, reset, text head)."""
+        from lerobot.rollout.inference.remote import BackendCommandKind, RemoteBackendInfo
+
+        command = pickle.loads(request.data)  # nosec
+
+        if command.kind is BackendCommandKind.INFO:
+            if self.policy is None:
+                raise RuntimeError("No policy loaded — call SendPolicyInstructions first")
+            reply = RemoteBackendInfo(
+                rtc_training_max_delay=int(getattr(self.policy.config, "rtc_training_max_delay", 0) or 0),
+                supports_text_generation=self.policy.supports_text_generation(),
+                supports_rtc=self.policy.supports_rtc(),
+            )
+        elif command.kind is BackendCommandKind.RESET:
+            self._rollout_backend().reset()
+            self.logger.info("Remote backend reset (policy + processors)")
+            reply = None
+        elif command.kind is BackendCommandKind.GENERATE_TEXT:
+            obs_frame, task, query = command.payload
+            reply = self._rollout_backend().generate_text(obs_frame, task, query)
+        else:
+            raise ValueError(f"Unknown backend command: {command.kind!r}")
+
+        return services_pb2.BackendReply(data=pickle.dumps(reply))
 
     def GetActions(self, request, context):  # noqa: N802
         """Returns actions to the robot client. Actions are sent as a single

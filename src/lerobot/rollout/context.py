@@ -297,6 +297,50 @@ def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy
     )
 
 
+def _connect_remote_backend(
+    cfg: RolloutConfig,
+    policy_config: PreTrainedConfig,
+    dataset_stats: dict | None,
+    robot_type: str,
+    hw_features: dict,
+):
+    """Hand a policy server everything it needs to stand in for a local policy.
+
+    The server rebuilds the processors from the same checkpoint, revision and stats, so
+    both sides normalize identically — otherwise the mismatch would surface as bad
+    actions rather than an error.  It also attaches the RTC config, which has to happen
+    where the weights are.
+    """
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+
+    from .inference.remote import RemoteInferenceBackend
+
+    backend = RemoteInferenceBackend(
+        server_address=cfg.inference.server_address,
+        policy_setup=RemotePolicyConfig(
+            policy_type=policy_config.type,
+            pretrained_name_or_path=str(cfg.policy.pretrained_path),
+            lerobot_features=hw_features,
+            actions_per_chunk=int(getattr(policy_config, "chunk_size", 0) or 0),
+            device=cfg.device,
+            rename_map=cfg.rename_map,
+            robot_type=robot_type,
+            pretrained_revision=policy_config.pretrained_revision,
+            dataset_stats=dataset_stats,
+            rtc_config=cfg.inference.rtc,
+        ),
+        timeout_s=cfg.inference.server_timeout_s,
+    )
+    backend.connect()
+    if not backend.info.supports_rtc:
+        raise ValueError(
+            f"The policy server at {cfg.inference.server_address} loaded a "
+            f"'{policy_config.type}' policy that does not implement RTC semantics. "
+            "Use '--inference.type=sync' without a server address, or serve an RTC policy."
+        )
+    return backend
+
+
 def build_rollout_context(
     cfg: RolloutConfig,
     shutdown_event: Event,
@@ -310,10 +354,17 @@ def build_rollout_context(
     fails fast without touching the robot.
     """
     is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
+    # The weights live on a policy server, so this process never loads them.  Only the
+    # model moves: the action queue, the delay estimate and the merge stay here next to
+    # the robot, which is what lets RTC measure a round trip and condition on it.
+    remote_address = cfg.inference.server_address if is_rtc else None
 
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
-    logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)
     policy_config = cfg.policy
+    if remote_address:
+        logger.info("Policy runs remotely on '%s'; not loading weights here", remote_address)
+    else:
+        logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)
 
     if is_rtc:
         _validate_trained_rtc_rollout_config(policy_config, cfg.inference)
@@ -327,9 +378,11 @@ def build_rollout_context(
             "Please use `cpu` or `cuda` backend."
         )
 
-    policy = _load_pretrained_policy(policy_config)
+    # A remote policy is checked against the server's own report of what it loaded
+    # (see step 7); there is nothing here to introspect.
+    policy = None if remote_address else _load_pretrained_policy(policy_config)
 
-    if is_rtc:
+    if is_rtc and policy is not None:
         if not supports_rtc_inference(policy):
             raise ValueError(
                 f"RTC inference is not supported by policy type '{policy_config.type}': "
@@ -340,17 +393,19 @@ def build_rollout_context(
         if hasattr(policy, "init_rtc_processor"):
             policy.init_rtc_processor()
 
-    policy = policy.to(cfg.device)
-    policy.eval()
-    logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
+    torch_compile_active = False
+    if policy is not None:
+        policy = policy.to(cfg.device)
+        policy.eval()
+        logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
 
-    torch_compile_active = cfg.use_torch_compile
-    if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
-        torch_compile_active = _wrap_predict_action_chunk_with_torch_compile(
-            policy,
-            backend=cfg.torch_compile_backend,
-            mode=cfg.torch_compile_mode,
-        )
+        torch_compile_active = cfg.use_torch_compile
+        if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
+            torch_compile_active = _wrap_predict_action_chunk_with_torch_compile(
+                policy,
+                backend=cfg.torch_compile_backend,
+                mode=cfg.torch_compile_mode,
+            )
 
     if cfg.use_torch_compile and not torch_compile_active:
         # RolloutConfig.__post_init__ reloads the policy configuration, so avoid
@@ -567,9 +622,15 @@ def build_rollout_context(
         cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
     )
     task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
+    backend = None
+    if remote_address:
+        backend = _connect_remote_backend(
+            cfg, policy_config, dataset_stats, robot_wrapper.robot_type, hw_features
+        )
     inference_strategy = create_inference_engine(
         cfg.inference,
         policy=policy,
+        backend=backend,
         preprocessor=preprocessor,
         postprocessor=postprocessor,
         robot_wrapper=robot_wrapper,

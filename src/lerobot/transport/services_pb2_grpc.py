@@ -25,7 +25,7 @@ if _version_not_supported:
     )
 
 
-class LearnerServiceStub:
+class LearnerServiceStub(object):
     """LearnerService: the Actor calls this to push transitions.
     The Learner implements this service.
     """
@@ -58,7 +58,7 @@ class LearnerServiceStub:
                 _registered_method=True)
 
 
-class LearnerServiceServicer:
+class LearnerServiceServicer(object):
     """LearnerService: the Actor calls this to push transitions.
     The Learner implements this service.
     """
@@ -119,7 +119,7 @@ def add_LearnerServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class LearnerService:
+class LearnerService(object):
     """LearnerService: the Actor calls this to push transitions.
     The Learner implements this service.
     """
@@ -233,7 +233,7 @@ class LearnerService:
             _registered_method=True)
 
 
-class AsyncInferenceStub:
+class AsyncInferenceStub(object):
     """AsyncInference: from Robot perspective
     Robot send observations to & executes action received from a remote Policy server
     """
@@ -264,9 +264,19 @@ class AsyncInferenceStub:
                 request_serializer=lerobot_dot_transport_dot_services__pb2.Empty.SerializeToString,
                 response_deserializer=lerobot_dot_transport_dot_services__pb2.Empty.FromString,
                 _registered_method=True)
+        self.PredictChunk = channel.stream_unary(
+                '/transport.AsyncInference/PredictChunk',
+                request_serializer=lerobot_dot_transport_dot_services__pb2.ChunkRequest.SerializeToString,
+                response_deserializer=lerobot_dot_transport_dot_services__pb2.ChunkResponse.FromString,
+                _registered_method=True)
+        self.BackendControl = channel.unary_unary(
+                '/transport.AsyncInference/BackendControl',
+                request_serializer=lerobot_dot_transport_dot_services__pb2.BackendCommand.SerializeToString,
+                response_deserializer=lerobot_dot_transport_dot_services__pb2.BackendReply.FromString,
+                _registered_method=True)
 
 
-class AsyncInferenceServicer:
+class AsyncInferenceServicer(object):
     """AsyncInference: from Robot perspective
     Robot send observations to & executes action received from a remote Policy server
     """
@@ -297,6 +307,30 @@ class AsyncInferenceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PredictChunk(self, request_iterator, context):
+        """Robot -> Policy: one chunk, conditioned on the caller's Real-Time Chunking state.
+
+        Unlike SendObservations/GetActions, which are two independent streams, this is a
+        single request/response: the caller measures the round trip and uses it as the
+        inference delay for the next chunk.  The server always answers, so a call that
+        returns is always one inference (see lerobot.rollout.inference.remote).
+
+        The request is streamed only because an observation frame carrying camera images
+        exceeds the 4MB message cap; it is still one logical call.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def BackendControl(self, request, context):
+        """Robot -> Policy: everything about the remote backend that is not an inference
+        (capability query, episode reset).  Kept off PredictChunk so that path stays one
+        call = one inference, which is what makes the measured round trip a valid delay.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_AsyncInferenceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -320,6 +354,16 @@ def add_AsyncInferenceServicer_to_server(servicer, server):
                     request_deserializer=lerobot_dot_transport_dot_services__pb2.Empty.FromString,
                     response_serializer=lerobot_dot_transport_dot_services__pb2.Empty.SerializeToString,
             ),
+            'PredictChunk': grpc.stream_unary_rpc_method_handler(
+                    servicer.PredictChunk,
+                    request_deserializer=lerobot_dot_transport_dot_services__pb2.ChunkRequest.FromString,
+                    response_serializer=lerobot_dot_transport_dot_services__pb2.ChunkResponse.SerializeToString,
+            ),
+            'BackendControl': grpc.unary_unary_rpc_method_handler(
+                    servicer.BackendControl,
+                    request_deserializer=lerobot_dot_transport_dot_services__pb2.BackendCommand.FromString,
+                    response_serializer=lerobot_dot_transport_dot_services__pb2.BackendReply.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'transport.AsyncInference', rpc_method_handlers)
@@ -328,7 +372,7 @@ def add_AsyncInferenceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class AsyncInference:
+class AsyncInference(object):
     """AsyncInference: from Robot perspective
     Robot send observations to & executes action received from a remote Policy server
     """
@@ -431,6 +475,60 @@ class AsyncInference:
             '/transport.AsyncInference/Ready',
             lerobot_dot_transport_dot_services__pb2.Empty.SerializeToString,
             lerobot_dot_transport_dot_services__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PredictChunk(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/transport.AsyncInference/PredictChunk',
+            lerobot_dot_transport_dot_services__pb2.ChunkRequest.SerializeToString,
+            lerobot_dot_transport_dot_services__pb2.ChunkResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def BackendControl(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/transport.AsyncInference/BackendControl',
+            lerobot_dot_transport_dot_services__pb2.BackendCommand.SerializeToString,
+            lerobot_dot_transport_dot_services__pb2.BackendReply.FromString,
             options,
             channel_credentials,
             insecure,

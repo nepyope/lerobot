@@ -18,6 +18,12 @@ Concrete backends (``sync``, ``rtc``, ...) expose the same small interface so
 rollout strategies never branch on which backend is in use.
 """
 
+from .backend import (
+    ChunkRequest,
+    ChunkResult,
+    InferenceBackend,
+    LocalInferenceBackend,
+)
 from .base import InferenceEngine, PolicyQuery, QueryAnswer, QueryKind
 from .factory import (
     InferenceEngineConfig,
@@ -29,8 +35,12 @@ from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
 
 __all__ = [
+    "ChunkRequest",
+    "ChunkResult",
+    "InferenceBackend",
     "InferenceEngine",
     "InferenceEngineConfig",
+    "LocalInferenceBackend",
     "PolicyQuery",
     "QueryAnswer",
     "QueryKind",

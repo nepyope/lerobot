@@ -635,23 +635,25 @@ def test_session_subtask_sets_and_reports_task(capsys):
 
 def test_sync_engine_uses_new_task_and_flushes_precomputed_actions():
     """A /subtask switch must reach the policy and drop stale queued actions."""
-    from lerobot.rollout.inference import SyncInferenceEngine
+    from lerobot.rollout.inference import LocalInferenceBackend, SyncInferenceEngine
 
     policy = MagicMock()
     policy.config.use_amp = False
     policy.select_action.return_value = torch.zeros(1, 2)
 
     engine = SyncInferenceEngine(
-        policy=policy,
-        preprocessor=lambda obs: obs,
-        postprocessor=lambda action: action,
+        backend=LocalInferenceBackend(
+            policy=policy,
+            preprocessor=lambda obs: obs,
+            postprocessor=lambda action: action,
+            device="cpu",
+            robot_type="mock",
+        ),
         dataset_features={
             "action": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
         },
         ordered_action_keys=["j1.pos", "j2.pos"],
         task="pick up the cube",
-        device="cpu",
-        robot_type="mock",
     )
 
     first = engine.get_action({"observation.state": np.zeros(1, dtype=np.float32)})
@@ -1282,21 +1284,23 @@ class _StubChunkPolicy:
 
 def _make_rtc_engine(rtc_queue_threshold: int = 30, chunk_len: int = 10):
     from lerobot.policies.rtc.configuration_rtc import RTCConfig
-    from lerobot.rollout.inference import RTCInferenceEngine
+    from lerobot.rollout.inference import LocalInferenceBackend, RTCInferenceEngine
 
     policy = _StubChunkPolicy(chunk_len=chunk_len)
     engine = RTCInferenceEngine(
-        policy=policy,
-        preprocessor=_IdentityPipeline(),
-        postprocessor=_IdentityPipeline(),
-        robot_wrapper=SimpleNamespace(robot_type="mock", action_features={}),
+        backend=LocalInferenceBackend(
+            policy=policy,
+            preprocessor=_IdentityPipeline(),
+            postprocessor=_IdentityPipeline(),
+            device="cpu",
+            robot_type="mock",
+        ),
         rtc_config=RTCConfig(enabled=True, execution_horizon=8, max_guidance_weight=1.0),
         hw_features={
             "observation.state": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
         },
         task="task A",
         fps=30.0,
-        device="cpu",
         rtc_queue_threshold=rtc_queue_threshold,
     )
     return engine, policy
