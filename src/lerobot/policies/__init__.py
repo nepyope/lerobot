@@ -53,6 +53,7 @@ from .rtc import (
 )
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
+from .theia_mlp.configuration_theia_mlp import TheiaMLPConfig as TheiaMLPConfig
 from .utils import make_robot_action, prepare_observation_for_inference
 from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig as VLAJEPAConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
@@ -92,6 +93,7 @@ __all__ = [
     "PraxisConfig",
     "SmolVLAConfig",
     "TDMPCConfig",
+    "TheiaMLPConfig",
     "VLAJEPAConfig",
     "VQBeTConfig",
     "WallXConfig",

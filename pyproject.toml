@@ -264,6 +264,7 @@ flux3 = [
     "lerobot[transformers-dep]",
 ]
 evo1 = ["lerobot[transformers-dep]"]
+theia_mlp = ["lerobot[transformers-dep]"]
 # fineart_vla: PI0.5-based policy that also trains a language head. The optional
 # fused training kernels (Liger Triton kernels, FlashRT Hub kernels) need Linux + CUDA.
 fineart_vla = ["lerobot[pi]"]
@@ -377,6 +378,7 @@ all = [
     "lerobot[groot]",
     "lerobot[xvla]",
     "lerobot[evo1]",
+    "lerobot[theia_mlp]",
     "lerobot[hilserl]",
     "lerobot[vla_jepa]",
     "lerobot[lingbot_va]",
